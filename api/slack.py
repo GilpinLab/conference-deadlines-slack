@@ -354,28 +354,40 @@ class handler(BaseHTTPRequestHandler):
                 return
 
             if command == "/deadline":
-                if not raw_text:
+                parts = raw_text.split() if raw_text else []
+                key = parts[0].lower() if parts else ""
+                tz_arg = parts[1] if len(parts) > 1 else None
+                
+                if not key or key == "help":
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
-                    usage_text = (
-                        "Usage: /deadline <conference> [timezone]\n"
+                    help_text = (
+                        "Conference Deadlines Bot\n\n"
+                        "Commands:\n"
+                        "  /deadline <conf> [timezone]  - Show deadlines for a conference\n"
+                        "  /deadline list               - List all supported conferences\n"
+                        "  /deadline help               - Show this help message\n\n"
                         "Examples:\n"
                         "  /deadline icml\n"
-                        "  /deadline icml America/New_York\n"
-                        "  /deadline neurips Europe/London\n\n"
-                        f"Supported conferences: {', '.join(sorted(ALLOWED_KEYS))}"
+                        "  /deadline icml America/Chicago\n"
+                        "  /deadline neurips US/Pacific"
                     )
                     self.wfile.write(
-                        json.dumps(
-                            {"response_type": "ephemeral", "text": usage_text}
-                        ).encode()
+                        json.dumps({"response_type": "ephemeral", "text": help_text}).encode()
                     )
                     return
                 
-                parts = raw_text.split()
-                key = parts[0].lower()
-                tz_arg = parts[1] if len(parts) > 1 else None
+                if key == "list":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    conf_list = "\n".join(f"  {k:12} - {v}" for k, v in sorted(CONFERENCE_MAPPINGS.items()) if k != "nips")
+                    list_text = f"Supported conferences:\n\n{conf_list}"
+                    self.wfile.write(
+                        json.dumps({"response_type": "ephemeral", "text": list_text}).encode()
+                    )
+                    return
             else:
                 key = command[1:].lower() if command.startswith("/") else ""
                 tz_arg = None
