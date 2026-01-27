@@ -3,6 +3,7 @@ import hmac
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler
@@ -61,17 +62,24 @@ DEADLINE_TYPE_LABELS = {
 DEADLINE_TYPE_ALIASES = {"submission": "paper"}
 
 
-def fetch_conference_data():
-    """Fetch conference data from huggingface/ai-deadlines repo."""
+def fetch_conference_data(conference_key: str) -> dict | None:
+    """Fetch conference data for a specific conference from huggingface/ai-deadlines repo."""
     conferences = {}
-    conference_files = list(ALLOWED_KEYS)
-    for conf in conference_files:
+    
+    keys_to_fetch = [conference_key]
+    if conference_key == "neurips":
+        keys_to_fetch.append("nips")
+    elif conference_key == "nips":
+        keys_to_fetch.append("neurips")
+    
+    for conf in keys_to_fetch:
         url = f"https://raw.githubusercontent.com/huggingface/ai-deadlines/main/src/data/conferences/{conf}.yml"
         r = requests.get(url, timeout=10)
         if r.status_code == 200:
             data = yaml.safe_load(r.text)
             if data:
                 conferences[conf] = data
+    
     return conferences if conferences else None
 
 
@@ -293,6 +301,25 @@ def format_deadline_response(deadlines: list[dict], conference_name: str, target
     }
 
 
+def process_deadline_request(response_url: str, key: str, name: str, target_tz: ZoneInfo | None):
+    """Fetch conference data and post response to Slack's response_url."""
+    data = fetch_conference_data(key)
+    if not data:
+        resp = {
+            "response_type": "ephemeral",
+            "text": "Sorry, I could not fetch conference data at the moment.",
+        }
+    else:
+        resp = format_deadline_response(find_conference_deadlines(key, data), name, target_tz)
+    
+    for attempt in range(3):
+        r = requests.post(response_url, json=resp, timeout=10)
+        if r.status_code == 200:
+            break
+        LOGGER.warning("Failed to post to response_url (attempt %d): %s", attempt + 1, r.status_code)
+        time.sleep(0.5)
+
+
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
@@ -337,6 +364,8 @@ class handler(BaseHTTPRequestHandler):
             LOGGER.info("form=%s", dict(form))
             command = (form.get("command", [""])[0] or "").strip()
             raw_text = (form.get("text", [""])[0] or "").strip()
+            response_url = (form.get("response_url", [""])[0] or "").strip()
+            
             if len(raw_text) > MAX_TEXT_CHARS:
                 self.send_response(413)
                 self.end_headers()
@@ -396,22 +425,22 @@ class handler(BaseHTTPRequestHandler):
 
             name = CONFERENCE_MAPPINGS.get(key, key)
 
-            data = fetch_conference_data()
-            resp = (
-                {
-                    "response_type": "ephemeral",
-                    "text": "Sorry, I could not fetch conference data at the moment.",
-                }
-                if not data
-                else format_deadline_response(
-                    find_conference_deadlines(key, data), name, target_tz
-                )
-            )
-
+            # Immediately acknowledge the request, then process asynchronously
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps(resp).encode())
+            self.wfile.write(
+                json.dumps({"response_type": "ephemeral", "text": f"Looking up {name} deadlines..."}).encode()
+            )
+            
+            # Process in background thread and post result to response_url
+            if response_url:
+                thread = threading.Thread(
+                    target=process_deadline_request,
+                    args=(response_url, key, name, target_tz),
+                    daemon=True,
+                )
+                thread.start()
         except Exception as e:
             self.send_response(500)
             self.send_header("Content-Type", "application/json")
