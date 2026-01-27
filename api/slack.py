@@ -373,9 +373,11 @@ class handler(BaseHTTPRequestHandler):
                         "  /deadline icml America/Chicago\n"
                         "  /deadline neurips US/Pacific"
                     )
-                    self.wfile.write(
-                        json.dumps({"response_type": "ephemeral", "text": help_text}).encode()
-                    )
+                    resp = {
+                        "response_type": "ephemeral",
+                        "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": f"```{help_text}```"}}],
+                    }
+                    self.wfile.write(json.dumps(resp).encode())
                     return
                 
                 if key == "list":
@@ -384,9 +386,11 @@ class handler(BaseHTTPRequestHandler):
                     self.end_headers()
                     conf_list = "\n".join(f"  {k:12} - {v}" for k, v in sorted(CONFERENCE_MAPPINGS.items()) if k != "nips")
                     list_text = f"Supported conferences:\n\n{conf_list}"
-                    self.wfile.write(
-                        json.dumps({"response_type": "ephemeral", "text": list_text}).encode()
-                    )
+                    resp = {
+                        "response_type": "ephemeral",
+                        "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": f"```{list_text}```"}}],
+                    }
+                    self.wfile.write(json.dumps(resp).encode())
                     return
             else:
                 key = command[1:].lower() if command.startswith("/") else ""
