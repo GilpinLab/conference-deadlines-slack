@@ -4,9 +4,10 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs
+from zoneinfo import ZoneInfo
 
 import requests
 import yaml
@@ -20,7 +21,9 @@ if not LOGGER.handlers:
     LOGGER.addHandler(_h)
 
 MAX_BODY_BYTES = 4096
-MAX_TEXT_CHARS = 64
+MAX_TEXT_CHARS = 128
+
+AOE_TZ = ZoneInfo("Etc/GMT+12")
 
 CONFERENCE_MAPPINGS = {
     "iclr": "ICLR",
@@ -44,111 +47,244 @@ CONFERENCE_MAPPINGS = {
 
 ALLOWED_KEYS = set(CONFERENCE_MAPPINGS.keys())
 
+DEADLINE_TYPE_ORDER = ["abstract", "paper", "supplementary", "review_release", "rebuttal_end", "notification", "camera_ready"]
+DEADLINE_TYPE_LABELS = {
+    "abstract": "Abstract",
+    "paper": "Paper Submission",
+    "submission": "Paper Submission",
+    "supplementary": "Supplementary",
+    "review_release": "Reviews Released",
+    "rebuttal_end": "Rebuttal Due",
+    "notification": "Notification",
+    "camera_ready": "Camera Ready",
+}
+DEADLINE_TYPE_ALIASES = {"submission": "paper"}
+
 
 def fetch_conference_data():
+    """Fetch conference data from huggingface/ai-deadlines repo."""
     conferences = {}
-    conference_files = [
-        "iclr",
-        "nips",
-        "neurips",
-        "cvpr",
-        "icml",
-        "aaai",
-        "acl",
-        "emnlp",
-        "iccv",
-        "eccv",
-        "ijcai",
-        "kdd",
-        "www",
-        "recsys",
-        "wacv",
-        "icassp",
-        "interspeech",
-    ]
+    conference_files = list(ALLOWED_KEYS)
     for conf in conference_files:
         url = f"https://raw.githubusercontent.com/huggingface/ai-deadlines/main/src/data/conferences/{conf}.yml"
-        try:
-            r = requests.get(url, timeout=10)
-            if r.status_code == 200:
-                data = yaml.safe_load(r.text)
-                if data:
-                    conferences[conf] = data
-        except Exception:
-            pass
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            data = yaml.safe_load(r.text)
+            if data:
+                conferences[conf] = data
     return conferences if conferences else None
 
 
-def find_conference_deadlines(conference_name, conferences_data):
+def parse_deadline_datetime(date_str: str) -> datetime | None:
+    """Parse a deadline string into a datetime object."""
+    if not date_str:
+        return None
+    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"]:
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def format_relative_time(dt: datetime, now: datetime) -> str:
+    """Format time relative to now (e.g., 'in 3 days' or '2 days ago')."""
+    diff = dt - now
+    total_seconds = diff.total_seconds()
+    
+    if abs(total_seconds) < 60:
+        return "now"
+    
+    is_future = total_seconds > 0
+    abs_seconds = abs(total_seconds)
+    
+    if abs_seconds < 3600:
+        minutes = int(abs_seconds / 60)
+        unit = "minute" if minutes == 1 else "minutes"
+        return f"in {minutes} {unit}" if is_future else f"{minutes} {unit} ago"
+    elif abs_seconds < 86400:
+        hours = int(abs_seconds / 3600)
+        unit = "hour" if hours == 1 else "hours"
+        return f"in {hours} {unit}" if is_future else f"{hours} {unit} ago"
+    else:
+        days = int(abs_seconds / 86400)
+        unit = "day" if days == 1 else "days"
+        return f"in {days} {unit}" if is_future else f"{days} {unit} ago"
+
+
+def get_target_timezone(tz_str: str | None) -> ZoneInfo | None:
+    """Get ZoneInfo from timezone string, with fallback to DEFAULT_TIMEZONE env var."""
+    tz_name = tz_str or os.getenv("DEFAULT_TIMEZONE")
+    if not tz_name:
+        return None
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return None
+
+
+def find_conference_deadlines(conference_key: str, conferences_data: dict) -> list[dict]:
+    """Find all deadline info for a conference."""
     if not conferences_data:
         return []
+    
     current_year = datetime.now().year
     results = []
-    key = conference_name.lower()
-    if key in conferences_data:
+    
+    keys_to_check = [conference_key]
+    if conference_key == "neurips":
+        keys_to_check.append("nips")
+    elif conference_key == "nips":
+        keys_to_check.append("neurips")
+    
+    for key in keys_to_check:
+        if key not in conferences_data:
+            continue
         for conf in conferences_data[key]:
-            if conf.get("year", 0) >= current_year:
-                info = {
-                    "name": conf.get("title", ""),
-                    "year": conf.get("year", ""),
-                    "date": conf.get("deadline", ""),
-                    "link": conf.get("link", ""),
-                    "location": f"{conf.get('city', '')}, {conf.get('country', '')}".strip(
-                        ", "
-                    ),
-                    "abstract_deadline": conf.get("abstract_deadline", ""),
-                    "venue": conf.get("venue", ""),
-                    "timezone": conf.get("timezone") or conf.get("tz"),
-                }
-                if "deadlines" in conf:
-                    for d in conf["deadlines"]:
-                        if d.get("type") == "abstract":
-                            info["abstract_deadline"] = d.get("date", "")
-                            if d.get("timezone") or d.get("tz"):
-                                info["timezone"] = d.get("timezone") or d.get("tz")
-                        elif d.get("type") == "submission":
-                            info["date"] = d.get("date", "")
-                            if d.get("timezone") or d.get("tz"):
-                                info["timezone"] = d.get("timezone") or d.get("tz")
-                results.append(info)
+            if conf.get("year", 0) < current_year:
+                continue
+            
+            deadlines = {}
+            if "deadlines" in conf:
+                for d in conf["deadlines"]:
+                    dtype = d.get("type", "")
+                    dtype = DEADLINE_TYPE_ALIASES.get(dtype, dtype)
+                    if dtype in DEADLINE_TYPE_LABELS:
+                        deadlines[dtype] = {
+                            "date": d.get("date", ""),
+                            "label": d.get("label", DEADLINE_TYPE_LABELS.get(dtype, dtype)),
+                        }
+            
+            if not deadlines and conf.get("deadline"):
+                deadlines["paper"] = {"date": conf.get("deadline", ""), "label": "Paper Submission"}
+            if not deadlines.get("abstract") and conf.get("abstract_deadline"):
+                deadlines["abstract"] = {"date": conf.get("abstract_deadline", ""), "label": "Abstract"}
+            
+            city = conf.get("city", "")
+            country = conf.get("country", "")
+            location = f"{city}, {country}".strip(", ") if city or country else ""
+            
+            info = {
+                "title": conf.get("title", ""),
+                "full_name": conf.get("full_name", ""),
+                "year": conf.get("year", ""),
+                "link": conf.get("link", ""),
+                "location": location,
+                "venue": conf.get("venue", ""),
+                "conf_date": conf.get("date", ""),
+                "deadlines": deadlines,
+            }
+            results.append(info)
+    
     return results
 
 
-def format_deadline_response(deadlines, conference_name):
+def select_best_conference(deadlines: list[dict]) -> dict:
+    """Select the most relevant conference entry (prefer ones with deadline info)."""
+    now_aoe = datetime.now(timezone.utc).astimezone(AOE_TZ)
+    
+    def has_future_deadlines(conf: dict) -> bool:
+        for dl in conf.get("deadlines", {}).values():
+            dt = parse_deadline_datetime(dl.get("date", ""))
+            if dt and dt.replace(tzinfo=AOE_TZ) > now_aoe:
+                return True
+        return False
+    
+    with_future = [c for c in deadlines if has_future_deadlines(c)]
+    if with_future:
+        return max(with_future, key=lambda d: d.get("year", 0))
+    
+    with_any_deadlines = [c for c in deadlines if c.get("deadlines")]
+    if with_any_deadlines:
+        return max(with_any_deadlines, key=lambda d: d.get("year", 0))
+    
+    return max(deadlines, key=lambda d: d.get("year", 0))
+
+
+def format_deadline_response(deadlines: list[dict], conference_name: str, target_tz: ZoneInfo | None) -> dict:
+    """Format deadline info for Slack response."""
     if not deadlines:
         return {
             "response_type": "ephemeral",
-            "text": f"No deadlines found for {conference_name}. Try: iclr, nips, cvpr, icml, aaai, acl, emnlp",
+            "text": f"No upcoming deadlines found for '{conference_name}'.\nSupported: {', '.join(sorted(ALLOWED_KEYS))}",
         }
 
-    def latest_key(d):
-        y = d.get("year") or 0
-        ds = d.get("date") or ""
-        try:
-            t = datetime.fromisoformat(ds)
-        except Exception:
-            t = datetime.min
-        return (y, t)
-
-    d = max(deadlines, key=latest_key)
-    sections = []
-    lines = [f"{d.get('name', '')} {d.get('year', '')}"]
-    tz = d.get("timezone") or ""
-    if d.get("abstract_deadline"):
-        suffix = f" ({tz})" if tz else ""
-        lines.append(f"Abstract: {d['abstract_deadline']}{suffix}")
-    if d.get("date"):
-        suffix = f" ({tz})" if tz else ""
-        lines.append(f"Paper:   {d['date']}{suffix}")
-    if d.get("location"):
-        lines.append(f"Location: {d['location']}")
-    if d.get("venue"):
-        lines.append(f"Venue:   {d['venue']}")
-    if d.get("link"):
-        lines.append(f"Link:    {d['link']}")
-    sections.append("\n".join(lines))
-
-    code = "\n\n".join(sections)
+    conf = select_best_conference(deadlines)
+    
+    now_utc = datetime.now(timezone.utc)
+    now_aoe = now_utc.astimezone(AOE_TZ)
+    
+    lines = []
+    
+    header = conf.get("title", conference_name)
+    if conf.get("year"):
+        header += f" {conf['year']}"
+    if conf.get("full_name"):
+        header += f"\n{conf['full_name']}"
+    lines.append(header)
+    lines.append("")
+    
+    conf_deadlines = conf.get("deadlines", {})
+    if conf_deadlines:
+        next_upcoming_type = None
+        for dtype in DEADLINE_TYPE_ORDER:
+            if dtype in conf_deadlines:
+                dt = parse_deadline_datetime(conf_deadlines[dtype]["date"])
+                if dt and dt.replace(tzinfo=AOE_TZ) > now_aoe:
+                    next_upcoming_type = dtype
+                    break
+        
+        for dtype in DEADLINE_TYPE_ORDER:
+            if dtype not in conf_deadlines:
+                continue
+            
+            dl = conf_deadlines[dtype]
+            dt = parse_deadline_datetime(dl["date"])
+            if not dt:
+                continue
+            
+            dt_aoe = dt.replace(tzinfo=AOE_TZ)
+            is_past = dt_aoe <= now_aoe
+            is_next = dtype == next_upcoming_type
+            
+            if target_tz:
+                dt_local = dt_aoe.astimezone(target_tz)
+                date_str = dt_local.strftime("%Y-%m-%d %H:%M")
+                tz_label = target_tz.key
+            else:
+                date_str = dt.strftime("%Y-%m-%d %H:%M")
+                tz_label = "AoE"
+            
+            relative = format_relative_time(dt_aoe, now_aoe)
+            label = DEADLINE_TYPE_LABELS.get(dtype, dtype)
+            
+            if is_past:
+                line = f"  {label}: {date_str} ({tz_label}) - PASSED"
+            elif is_next:
+                line = f"> {label}: {date_str} ({tz_label}) [{relative}] <-- NEXT"
+            else:
+                line = f"  {label}: {date_str} ({tz_label}) [{relative}]"
+            
+            lines.append(line)
+    else:
+        lines.append("  No deadline information available")
+    
+    lines.append("")
+    
+    if conf.get("conf_date"):
+        lines.append(f"Conference: {conf['conf_date']}")
+    if conf.get("location"):
+        lines.append(f"Location:   {conf['location']}")
+    if conf.get("venue"):
+        lines.append(f"Venue:      {conf['venue']}")
+    if conf.get("link"):
+        lines.append(f"Link:       {conf['link']}")
+    
+    lines.append("")
+    tz_hint = f"Times shown in {target_tz.key}" if target_tz else "Tip: /deadline <conf> <timezone>  e.g. /deadline icml America/New_York"
+    lines.append(tz_hint)
+    
+    code = "\n".join(lines)
     return {
         "response_type": "ephemeral",
         "blocks": [
@@ -166,13 +302,10 @@ class handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             body = self.rfile.read(length).decode("utf-8")
-            try:
-                LOGGER.info("headers=%s", dict(self.headers))
-                LOGGER.info("raw_body=%s", body)
-            except Exception:
-                pass
+            LOGGER.info("headers=%s", dict(self.headers))
+            LOGGER.info("raw_body=%s", body)
 
-            # Slack signature verification (optional but recommended)
+            # Slack signature verification
             signing_secret = os.getenv("SLACK_SIGNING_SECRET")
             if signing_secret:
                 ts = self.headers.get("X-Slack-Request-Timestamp")
@@ -201,10 +334,7 @@ class handler(BaseHTTPRequestHandler):
                     self.end_headers()
                     return
             form = parse_qs(body)
-            try:
-                LOGGER.info("form=%s", {k: v for k, v in form.items()})
-            except Exception:
-                pass
+            LOGGER.info("form=%s", dict(form))
             command = (form.get("command", [""])[0] or "").strip()
             raw_text = (form.get("text", [""])[0] or "").strip()
             if len(raw_text) > MAX_TEXT_CHARS:
@@ -217,30 +347,46 @@ class handler(BaseHTTPRequestHandler):
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
+                    usage_text = (
+                        "Usage: /deadline <conference> [timezone]\n"
+                        "Examples:\n"
+                        "  /deadline icml\n"
+                        "  /deadline icml America/New_York\n"
+                        "  /deadline neurips Europe/London\n\n"
+                        f"Supported conferences: {', '.join(sorted(ALLOWED_KEYS))}"
+                    )
                     self.wfile.write(
                         json.dumps(
-                            {
-                                "response_type": "ephemeral",
-                                "text": "Usage: /deadline <conf>. Try: iclr, neurips, cvpr, icml, aaai, acl, emnlp",
-                            }
+                            {"response_type": "ephemeral", "text": usage_text}
                         ).encode()
                     )
                     return
-                key = raw_text.split()[0].lower()
+                
+                parts = raw_text.split()
+                key = parts[0].lower()
+                tz_arg = parts[1] if len(parts) > 1 else None
             else:
                 key = command[1:].lower() if command.startswith("/") else ""
-            try:
-                LOGGER.info(
-                    "parsed command=%s raw_text=%s key=%s", command, raw_text, key
-                )
-            except Exception:
-                pass
-            # Validate requested key if provided
+                tz_arg = None
+            
+            LOGGER.info("parsed command=%s raw_text=%s key=%s tz_arg=%s", command, raw_text, key, tz_arg)
+            
             if key and key not in ALLOWED_KEYS:
-                suggestions = ", ".join(sorted(list(ALLOWED_KEYS))[:8])
                 resp = {
                     "response_type": "ephemeral",
-                    "text": f"Unknown conference '{key}'. Try: {suggestions}",
+                    "text": f"Unknown conference '{key}'.\nSupported: {', '.join(sorted(ALLOWED_KEYS))}",
+                }
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(resp).encode())
+                return
+
+            target_tz = get_target_timezone(tz_arg)
+            if tz_arg and not target_tz:
+                resp = {
+                    "response_type": "ephemeral",
+                    "text": f"Invalid timezone '{tz_arg}'.\nExamples: America/New_York, Europe/London, Asia/Tokyo, US/Pacific",
                 }
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -258,7 +404,7 @@ class handler(BaseHTTPRequestHandler):
                 }
                 if not data
                 else format_deadline_response(
-                    find_conference_deadlines(name, data), name
+                    find_conference_deadlines(key, data), name, target_tz
                 )
             )
 
