@@ -7,16 +7,17 @@ Deployed via Vercel. Endpoint: `/api/slack`
 ## Usage
 
 ```
-/deadline <conference> [timezone]
+/deadline <conference> [timezone]   Show deadlines for a conference
+/deadline list                      List all supported conferences
+/deadline help                      Show help message
 ```
 
 **Examples:**
 ```
 /deadline icml                      # Shows deadlines in AoE (Anywhere on Earth)
-/deadline icml America/New_York     # Converts to Eastern Time
-/deadline neurips Europe/London     # Converts to UK time
-/deadline cvpr Asia/Tokyo           # Converts to Japan time
-/deadline iclr US/Pacific           # Converts to Pacific Time
+/deadline icml America/Chicago      # Converts to Central Time
+/deadline neurips US/Pacific        # Converts to Pacific Time
+/deadline list                      # Shows all available conferences
 ```
 
 ## Features
