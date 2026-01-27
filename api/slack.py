@@ -266,15 +266,18 @@ def format_deadline_response(deadlines: list[dict], conference_name: str, target
             label = DEADLINE_TYPE_LABELS.get(dtype, dtype)
             
             if is_past:
-                line = f"  {label}: {date_str} ({tz_label}) - PASSED"
+                marker = "[x]"
+                line = f"{marker} {label}: {date_str} ({tz_label})"
             elif is_next:
-                line = f"> {label}: {date_str} ({tz_label}) [{relative}] <-- NEXT"
+                marker = "[*]"
+                line = f"{marker} {label}: {date_str} ({tz_label}) [{relative}]"
             else:
-                line = f"  {label}: {date_str} ({tz_label}) [{relative}]"
+                marker = "[o]"
+                line = f"{marker} {label}: {date_str} ({tz_label}) [{relative}]"
             
             lines.append(line)
     else:
-        lines.append("  No deadline information available")
+        lines.append("No deadline information available")
     
     lines.append("")
     
@@ -287,9 +290,9 @@ def format_deadline_response(deadlines: list[dict], conference_name: str, target
     if conf.get("link"):
         lines.append(f"Link:       {conf['link']}")
     
-    lines.append("")
-    tz_hint = f"Times shown in {target_tz.key}" if target_tz else "Tip: /deadline <conf> <timezone>  e.g. /deadline icml America/New_York"
-    lines.append(tz_hint)
+    if not target_tz:
+        lines.append("")
+        lines.append("Tip: /deadline <conf> <tz>  e.g. /deadline icml America/Chicago")
     
     code = "\n".join(lines)
     return {
