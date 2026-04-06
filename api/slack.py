@@ -25,6 +25,29 @@ MAX_TEXT_CHARS = 128
 
 AOE_TZ = ZoneInfo("Etc/GMT+12")
 
+TIMEZONE_ALIASES = {
+    "pt": "US/Pacific",
+    "pst": "US/Pacific",
+    "pdt": "US/Pacific",
+    "mt": "US/Mountain",
+    "mst": "US/Mountain",
+    "mdt": "US/Mountain",
+    "ct": "US/Central",
+    "cst": "US/Central",
+    "cdt": "US/Central",
+    "et": "US/Eastern",
+    "est": "US/Eastern",
+    "edt": "US/Eastern",
+    "utc": "UTC",
+    "gmt": "GMT",
+    "aoe": "Etc/GMT+12",
+    "jst": "Asia/Tokyo",
+    "cet": "Europe/Berlin",
+    "cest": "Europe/Berlin",
+    "ist": "Asia/Kolkata",
+    "kst": "Asia/Seoul",
+}
+
 CONFERENCE_MAPPINGS = {
     "iclr": "ICLR",
     "nips": "NeurIPS",
@@ -120,12 +143,13 @@ def format_relative_time(dt: datetime, now: datetime) -> str:
 
 
 def get_target_timezone(tz_str: str | None) -> ZoneInfo | None:
-    """Get ZoneInfo from timezone string, with fallback to DEFAULT_TIMEZONE env var."""
+    """Get ZoneInfo from timezone string, with case-insensitive alias support."""
     tz_name = tz_str or os.getenv("DEFAULT_TIMEZONE")
     if not tz_name:
         return None
+    resolved = TIMEZONE_ALIASES.get(tz_name.lower(), tz_name)
     try:
-        return ZoneInfo(tz_name)
+        return ZoneInfo(resolved)
     except Exception:
         return None
 
@@ -292,7 +316,7 @@ def format_deadline_response(deadlines: list[dict], conference_name: str, target
     
     if not target_tz:
         lines.append("")
-        lines.append("Tip: /deadline <conf> <tz>  e.g. /deadline icml America/Chicago")
+        lines.append("Tip: /deadline <conf> <tz>  e.g. /deadline icml pt")
     
     code = "\n".join(lines)
     return {
@@ -367,9 +391,11 @@ class handler(BaseHTTPRequestHandler):
                         "Commands:\n"
                         "  /deadline <conf> [timezone]  - Show deadlines for a conference\n"
                         "  /deadline list               - List all supported conferences\n"
+                        "  /deadline timezones          - List timezone shortcuts\n"
                         "  /deadline help               - Show this help message\n\n"
                         "Examples:\n"
                         "  /deadline icml\n"
+                        "  /deadline icml pt\n"
                         "  /deadline icml America/Chicago\n"
                         "  /deadline neurips US/Pacific"
                     )
@@ -389,6 +415,25 @@ class handler(BaseHTTPRequestHandler):
                     resp = {
                         "response_type": "ephemeral",
                         "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": f"```{list_text}```"}}],
+                    }
+                    self.wfile.write(json.dumps(resp).encode())
+                    return
+                
+                if key == "timezones":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    seen = {}
+                    for alias, iana in sorted(TIMEZONE_ALIASES.items()):
+                        seen.setdefault(iana, []).append(alias)
+                    tz_lines = "\n".join(
+                        f"  {', '.join(aliases):20} -> {iana}"
+                        for iana, aliases in sorted(seen.items(), key=lambda x: x[0])
+                    )
+                    tz_text = f"Timezone shortcuts (case-insensitive):\n\n{tz_lines}\n\nFull IANA names (e.g. America/Chicago) are also accepted."
+                    resp = {
+                        "response_type": "ephemeral",
+                        "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": f"```{tz_text}```"}}],
                     }
                     self.wfile.write(json.dumps(resp).encode())
                     return
